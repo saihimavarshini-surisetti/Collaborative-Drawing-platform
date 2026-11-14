@@ -1,0 +1,562 @@
+import React, { useRef, useState, useEffect } from 'react';
+import { Canvas, PencilBrush, Textbox, Rect, Circle as Cir } from 'fabric';
+import { Square, Circle, Type, Move, Pencil, Trash2, Save, Download, Copy, Check } from 'lucide-react';
+import Settings from './Settings';
+import axios from "axios";
+import { useParams, useLocation, useNavigate } from "react-router-dom";
+import io from "socket.io-client";
+import { toast } from "react-hot-toast";
+import GroupVoiceChat from './GroupVoiceChat';
+import Loading from './Loading';
+
+const Whiteboard = () => {
+  const { boardId } = useParams();
+  const canvasRef = useRef(null);
+  const [canvas, setCanvas] = useState(null);
+  const [brushWidth, setBrushWidth] = useState(5);
+  const [freeDrawingEnabled, setFreeDrawingEnabled] = useState(false);
+  const [initialData, setInitialData] = useState(null);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const socketRef = useRef(null);
+  const isUpdatingFromSocketRef = useRef(false);
+  const joinedRef = useRef(false);
+  const [showAIModal, setShowAIModal] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const attemptedCreateRef = useRef(false);
+  const [copied, setCopied] = useState(false);
+  const copyTimeoutRef = useRef(null);
+  const [loading, setLoading] = useState(false);
+  
+
+  // Load initial whiteboard data
+  useEffect(() => {
+    const loadOrCreate = async () => {
+      if (!location.state?.data) {
+        try {
+          const res = await axios.get(
+            `https://codraw-backend-mw58.onrender.com/api/whiteboards/${boardId}`,
+            { withCredentials: true }
+          );
+          if (res.data?.data) {
+            setInitialData(res.data.data);
+            return;
+          }
+        } catch (err) {
+          const status = err?.response?.status;
+          if (status === 403) {
+            alert('Access Denied. Redirecting to Home...');
+            navigate('/');
+            return;
+          }
+          if (status === 404) {
+            console.warn('Whiteboard not found. Creating new one...');
+            if (canvas && !attemptedCreateRef.current) {
+              attemptedCreateRef.current = true;
+              try {
+                const whiteboardData = JSON.stringify(canvas.toJSON());
+                const previewImage = canvas.toDataURL('image/png');
+                const uploadResponse = await axios.post(
+                  'https://codraw-backend-mw58.onrender.com/api/whiteboards/upload-preview',
+                  { image: previewImage },
+                  { withCredentials: true }
+                );
+                const cloudinaryUrl = uploadResponse.data.url;
+                await axios.post(
+                  'https://codraw-backend-mw58.onrender.com/api/whiteboards/save',
+                  { boardId, data: whiteboardData, previewImage: cloudinaryUrl },
+                  { withCredentials: true }
+                );
+                console.log('New whiteboard created and saved.');
+              } catch (saveErr) {
+                console.error('Failed to create new whiteboard on 404:', saveErr);
+                navigate('/');
+              }
+            }
+            return;
+          }
+          console.error('Error fetching whiteboard:', err);
+        }
+      } else {
+        setInitialData(location.state.data);
+      }
+    };
+    loadOrCreate();
+  }, [boardId, location.state?.data, canvas, navigate]);
+
+  
+
+  const emitCanvasData = () => {
+    if (!isUpdatingFromSocketRef.current && canvas && socketRef.current) {
+      const json = JSON.stringify(canvas.toJSON());
+      socketRef.current.emit("canvas-data", { boardId, data: json });
+      console.log("Change emitted")
+    }
+  };
+
+  // Initialize canvas on mount
+  useEffect(() => {
+    if (canvasRef.current) {
+      const initCanvas = new Canvas(canvasRef.current, {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        enableRetinaScaling: true
+      });
+
+      initCanvas.backgroundColor = '#fff';
+      initCanvas.renderAll();
+      setCanvas(initCanvas);
+      return () => initCanvas.dispose();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!canvas) return;
+  
+    const emitOnAdd = () => {
+      if (!isUpdatingFromSocketRef.current) emitCanvasData();
+    };
+  
+    const emitOnModify = () => {
+      if (!isUpdatingFromSocketRef.current) emitCanvasData();
+    };
+  
+    canvas.on("object:added", emitOnAdd);
+    canvas.on("object:modified", emitOnModify);
+    canvas.on("object:removed", emitOnModify);
+    canvas.on("path:created", emitOnAdd);
+  
+    return () => {
+      canvas.off("object:added", emitOnAdd);
+      canvas.off("object:modified", emitOnModify);
+      canvas.off("object:removed", emitOnModify);
+      canvas.off("path:created", emitOnAdd);
+    };
+  }, [canvas]);
+  
+
+  
+  // Load existing whiteboard data into canvas
+  useEffect(() => {
+    if (canvas && initialData) {
+      isUpdatingFromSocketRef.current = true;
+      canvas.loadFromJSON(initialData, () => {
+        canvas.renderAll();
+        canvas.requestRenderAll();
+        isUpdatingFromSocketRef.current = false;
+      });
+    }
+  }, [canvas, initialData]);
+
+  // Emit join once socket is ready
+  useEffect(() => {
+    if (socketRef.current && !joinedRef.current) {
+      socketRef.current.emit("join-board", { boardId, data: initialData ?? null, role: "host" });
+      joinedRef.current = true;
+    }
+  }, [boardId, initialData]);
+
+  useEffect(() => {
+    if(!canvas) return;
+    const socket = io("https://codraw-backend-mw58.onrender.com/");
+    socketRef.current = socket;
+  
+    const handleCanvasUpdate = ({ boardId: incomingId, data }) => {
+      if (incomingId === boardId && canvas) {
+        isUpdatingFromSocketRef.current = true;
+        canvas.loadFromJSON(data, () => {
+          canvas.renderAll();
+          isUpdatingFromSocketRef.current = false;
+        });
+      }
+    };
+
+    // Listen for updates
+    socket.on("canvas-data", handleCanvasUpdate);
+
+    socket.on("viewer-joined", ({ boardId, socketId, timestamp }) => {
+      toast.success("A viewer joined Whiteboard");
+      fetch('https://codraw-backend-mw58.onrender.com/api/metrics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'viewer-joined',
+          boardId: boardId,
+          timestamp: new Date().toISOString()
+        })
+      }).then(async res => {
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Metrics POST failed: ${res.status} ${text}`);
+        }
+        return res.json();
+      })
+      .then(data => console.log("Metric logged:", data))
+      .catch(err => console.error("Metric logging failed:", err));
+      console.log(`Viewer socket ${socketId} joined at ${timestamp}`);
+
+      // Send the latest live canvas state to the newly joined viewer
+      try {
+        if (canvas) {
+          const currentJson = JSON.stringify(canvas.toJSON());
+          socket.emit("send-current-data", { boardId, data: currentJson, socketId });
+        }
+      } catch (e) {
+        console.error("Failed to emit current canvas to viewer:", e);
+      }
+    });
+    
+    return () => {
+      socket.off("canvas-data", handleCanvasUpdate);
+      socket.disconnect();
+    };
+  }, [boardId, canvas]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+    };
+  }, []);
+
+  // Save canvas to backend
+  const saveWhiteboard = async () => {
+    if (!canvas) return;
+    setLoading(true);
+    const whiteboardData = JSON.stringify(canvas.toJSON());
+    const previewImage = canvas.toDataURL('image/png');
+
+    try {
+      // 1. Upload image preview to Cloudinary via backend
+      const uploadResponse = await axios.post(
+        "https://codraw-backend-mw58.onrender.com/api/whiteboards/upload-preview",
+        { image: previewImage }, // send base64 string directly
+        { withCredentials: true }
+      );
+  
+      const cloudinaryUrl = uploadResponse.data.url;
+  
+      // 2. Save the whiteboard with the image URL
+        await axios.post(
+        "https://codraw-backend-mw58.onrender.com/api/whiteboards/save",
+        { boardId, data: whiteboardData, previewImage: cloudinaryUrl },
+        { withCredentials: true }
+      );
+
+      fetch('https://codraw-backend-mw58.onrender.com/api/metrics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'Whiteboard Saved',
+          boardId: boardId,
+          timestamp: new Date().toISOString()
+        })
+      }).then(async res => {
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Metrics POST failed: ${res.status} ${text}`);
+        }
+        return res.json();
+      })
+      .then(data => console.log("Metric logged:", data))
+      .catch(err => console.error("Metric logging failed:", err));
+      
+      setLoading(false);
+    } catch (error) {
+      setLoading(false);
+      console.error("Error saving whiteboard:", error);
+      alert("Failed to save whiteboard");
+    }
+  };
+
+  const openAIModal = () => {
+    setAiPrompt("");
+    setShowAIModal(true);
+  };
+
+  const submitAIPrompt = async () => {
+    if (!aiPrompt) return;
+  
+    try {
+      const res = await fetch('https://codraw-backend-mw58.onrender.com/api/text-to-drawing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: aiPrompt })
+      });
+  
+      const data = await res.json();
+      const instructions = JSON.parse(data.text);
+  
+      instructions.forEach(obj => {
+        if (obj.type === 'circle') {
+          const circle = new Cir({
+            left: obj.x,
+            top: obj.y,
+            radius: obj.radius || 30,
+            fill: obj.color || 'yellow'
+          });
+          canvas.add(circle);
+        } else if (obj.type === 'rect') {
+          const rect = new Rect({
+            left: obj.x,
+            top: obj.y,
+            width: obj.width || 100,
+            height: obj.height || 50,
+            fill: obj.color || 'blue'
+          });
+          canvas.add(rect);
+        }
+      });
+
+      fetch('https://codraw-backend-mw58.onrender.com/api/metrics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'AI text-to-drawing used!',
+          boardId: boardId,
+          timestamp: new Date().toISOString()
+        })
+      }).then(async res => {
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Metrics POST failed: ${res.status} ${text}`);
+        }
+        return res.json();
+      })
+      .then(data => console.log("Metric logged:", data))
+      .catch(err => console.error("Metric logging failed:", err));
+  
+      canvas.renderAll();
+    } catch (err) {
+      console.error("AI Drawing failed:", err);
+      alert("Failed to draw from AI. Check console for error.");
+    } finally {
+      setShowAIModal(false);
+    }
+  };
+  
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    if (canvas) {
+      const handleKeyDown = (event) => {
+        if (event.key == "Delete" || event.keyCode == 46 && canvas.getActiveObjects().length > 0) {
+          canvas.getActiveObjects().forEach(obj => canvas.remove(obj));
+          canvas.discardActiveObject();
+          canvas.renderAll();
+        }
+        if (event.key === "Escape") {
+          disableFreeDraw();
+          canvas.discardActiveObject();
+          canvas.renderAll();
+        }
+      };
+
+      document.addEventListener("keydown", handleKeyDown);
+      return () => document.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [canvas]);
+
+  // Drawing and shape tools
+  const addCircle = () => {
+    if (canvas) {
+      disableFreeDraw();
+      const cir = new Cir({ radius: 50, top: 250, left: 350, fill: "#000" });
+      canvas.add(cir);
+    }
+  };
+
+  const addRectangle = () => {
+    if (canvas) {
+      disableFreeDraw();
+      const rect = new Rect({ top: 250, left: 350, width: 100, height: 100, fill: "#000" });
+      canvas.add(rect);
+    }
+  };
+
+  const addTextBox = () => {
+    if (canvas) {
+      disableFreeDraw();
+      const tb = new Textbox("Enter Text", {
+        top: 250,
+        left: 350,
+        width: 150,
+        fontSize: 20,
+        textAlign: 'center',
+        fixedWidth: 150
+      });
+
+      canvas.on('text:changed', (opt) => {
+        const t1 = opt.target;
+        if (t1.width > t1.fixedWidth) {
+          t1.fontSize *= t1.fixedWidth / (t1.width + 1);
+          t1.width = t1.fixedWidth;
+        }
+      });
+
+      canvas.add(tb);
+    }
+  };
+
+  const enableFreeDraw = () => {
+    if (canvas) {
+      setFreeDrawingEnabled(true);
+      canvas.isDrawingMode = true;
+      canvas.freeDrawingBrush = new PencilBrush(canvas);
+      canvas.freeDrawingBrush.color = '#000000';
+      canvas.freeDrawingBrush.width = brushWidth;
+    }
+  };
+
+  const disableFreeDraw = () => {
+    if (canvas) {
+      setFreeDrawingEnabled(false);
+      canvas.isDrawingMode = false;
+      canvas.selection = true;
+      canvas.forEachObject((obj) => (obj.selectable = true));
+    }
+  };
+
+  const updateBrushColor = (e) => {
+    if (canvas) canvas.freeDrawingBrush.color = e.target.value;
+  };
+
+  const updateBrushWidth = (e) => {
+    const newWidth = parseInt(e.target.value, 10) || 1;
+    setBrushWidth(newWidth);
+    if (canvas?.isDrawingMode) canvas.freeDrawingBrush.width = newWidth;
+  };
+
+  const clearCanvas = () => {
+    if (canvas) {
+      canvas.clear();
+      canvas.backgroundColor = "#fff";
+      canvas.renderAll();
+    }
+  };
+
+  const exportCanvasAsImage = () => {
+    if (!canvas) return;
+    const dataURL = canvas.toDataURL({ format: 'png', quality: 1.0 });
+    const link = document.createElement('a');
+    link.href = dataURL;
+    link.download = `whiteboard-${boardId}.png`;
+    link.click();
+  };
+
+  return (
+    <>
+      {loading && <Loading />}
+      <div className="relative overflow-hidden">
+        <div className="toolbar absolute top-[2%] z-[20] shadow-lg left-1/2 -translate-x-1/2 bg-gray-100 rounded-[10px] flex gap-5 px-3 py-3 justify-center items-center border border-gray-300">
+          <button onClick={disableFreeDraw} className='cursor-pointer hover:bg-[#8f00ff]/80 hover:text-white p-1 rounded-[5px]' title='Move'><Move size={20} /></button>
+          <button onClick={addRectangle} className='cursor-pointer hover:bg-[#8f00ff]/80 hover:text-white p-1 rounded-[5px]' title='Square'><Square size={20} /></button>
+          <button onClick={addCircle} className='cursor-pointer hover:bg-[#8f00ff]/80 hover:text-white p-1 rounded-[5px]' title='Circle'><Circle size={20} /></button>
+          <button onClick={addTextBox} className='cursor-pointer hover:bg-[#8f00ff]/80 hover:text-white p-1 rounded-[5px]' title='TextBox'><Type size={20} /></button>
+          <button onClick={enableFreeDraw} className='cursor-pointer hover:bg-[#8f00ff]/80 hover:text-white p-1 rounded-[5px]' title='Free Draw'><Pencil size={20} /></button>
+
+          {freeDrawingEnabled && (
+            <div className='flex items-center gap-2 bg-gray-100 px-[10px] py-[6px] font-mono rounded-[10px] text-sm'>
+              <input type="color" onChange={updateBrushColor} />
+              <label className='flex items-center gap-1'>
+                Width:
+                <input type="number" min="1" max="50" value={brushWidth} className='pl-1 border border-gray-300' onChange={updateBrushWidth} />
+              </label>
+            </div>
+          )}
+
+          <button onClick={clearCanvas} className='cursor-pointer bg-gray-100 hover:bg-[#8f00ff]/80 hover:text-white flex items-center gap-2 p-[10px] text-nowrap font-mono rounded-[10px] text-sm'>
+            <Trash2 size={15} /> clear canvas
+          </button>
+
+          <div className='h-[40px] w-[2px] bg-gray-200 block'></div>
+
+          <button onClick={saveWhiteboard} className='cursor-pointer hover:bg-[#8f00ff]/80 hover:text-white p-1 rounded-[5px]' title='Save Whiteboard'>
+            <Save size={20} />
+          </button>
+
+          <button onClick={exportCanvasAsImage} className='cursor-pointer bg-white hover:bg-[#8f00ff]/80 hover:text-white flex items-center gap-2 p-[10px] font-mono text-nowrap rounded-[10px] text-sm'>
+            <Download size={20} /> Export as PNG
+          </button>
+          <div className='bg-white flex flex-col items-center justify-center font-mono gap-2 rounded-[10px] py-[5px] px-[8px]'>
+            <h1 className='text-nowrap'>Join Code:</h1> 
+            <div 
+              className='cursor-pointer w-full bg-neutral-300 hover:bg-[#8f00ff]/80 hover:text-white flex items-center gap-2 p-[5px] font-mono rounded-[5px] text-[10px] text-nowrap' 
+              onClick={() => {
+                const joinCode = boardId;
+                navigator.clipboard.writeText(joinCode)
+                  .then(() => {
+                    setCopied(true);
+                    if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+                    copyTimeoutRef.current = setTimeout(() => setCopied(false), 2000);
+                  })
+                  .catch(err => {
+                    console.error('Failed to copy:', err);
+                  });
+              }}
+            >
+              {boardId} {copied ? <Check size={15} className='text-green-600'/> : <Copy size={15}/>}
+            </div>
+          </div>
+          <GroupVoiceChat boardId={boardId}/>
+        </div>
+
+        <Settings canvas={canvas} />
+        <div className='flex'>
+          <canvas id="canvas" ref={canvasRef}></canvas>
+        </div>
+
+        <button 
+          onClick={openAIModal}
+          style={{
+            position: 'fixed',
+            bottom: '20px',
+            right: '20px',
+            borderRadius: '50%',
+            backgroundColor: '#111',
+            color: 'white',
+            border: 'none',
+            width: '60px',
+            height: '60px',
+            cursor: 'pointer',
+            fontSize: '1.5rem',
+            zIndex: 9999
+          }}
+          title="AI Drawing Assistant"
+        >
+          🤖
+        </button>
+
+        {showAIModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999]">
+            <div className="bg-white p-6 rounded-xl shadow-lg w-[90%] max-w-md">
+              <h2 className="text-xl font-bold mb-4">AI Drawing Prompt</h2>
+              <input
+                type="text"
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                placeholder="What should I draw for you?"
+                className="w-full border border-gray-300 rounded-md p-2 mb-4"
+              />
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => setShowAIModal(false)}
+                  className="px-4 py-2 bg-gray-300 rounded hover:bg-gray-400"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={submitAIPrompt}
+                  className="px-4 py-2 bg-[#8f00ff] text-white rounded hover:bg-[#7500d1]"
+                >
+                  Draw
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </>
+  );
+};
+
+export default Whiteboard;
